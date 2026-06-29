@@ -76,6 +76,18 @@ struct AppConfig {
     hide_dock_when_minimized: bool,
     #[serde(default = "default_snap_to_grid")]
     snap_to_grid: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
+    #[serde(default)]
+    launch_at_login: bool,
+    #[serde(default = "default_grid")]
+    grid_columns: u32,
+    #[serde(default = "default_grid")]
+    grid_rows: u32,
+    #[serde(default)]
+    suppress_move_warnings: bool,
+    #[serde(default)]
+    icloud_sync: bool,
 }
 
 fn default_config_version() -> u32 {
@@ -88,6 +100,14 @@ fn default_app_icon_id() -> String {
 
 fn default_snap_to_grid() -> bool {
     true
+}
+
+fn default_theme() -> String {
+    "system".to_string()
+}
+
+fn default_grid() -> u32 {
+    12
 }
 
 #[derive(Debug, Serialize)]
@@ -267,17 +287,33 @@ fn reveal_current_app_in_finder() {
 
 #[tauri::command]
 fn load_app_config(app: AppHandle) -> Result<Option<AppConfig>, String> {
-    let path = app_config_path(&app)?;
-    if !path.exists() {
-        return Ok(None);
-    }
+    let local_path = app_config_path(&app)?;
+    let local = read_config_at(&local_path);
 
-    let raw = fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read config file: {error}"))?;
-    let config = serde_json::from_str::<AppConfig>(&raw)
-        .map_err(|error| format!("Failed to parse config file: {error}"))?;
+    // Consider the iCloud copy when local sync is enabled, or when there is no
+    // local config yet (e.g. a freshly set up Mac that already has iCloud data).
+    let consider_icloud = local.as_ref().map(|c| c.icloud_sync).unwrap_or(true);
+    let icloud = if consider_icloud {
+        icloud_config_path(&app).and_then(|path| read_config_at(&path).map(|cfg| (path, cfg)))
+    } else {
+        None
+    };
 
-    Ok(Some(config))
+    // Last-writer-wins by file mtime so layouts roam across Macs via iCloud.
+    let resolved = match (local, icloud) {
+        (Some(local_cfg), Some((icloud_path, icloud_cfg))) => {
+            if file_is_newer(&icloud_path, &local_path) {
+                Some(icloud_cfg)
+            } else {
+                Some(local_cfg)
+            }
+        }
+        (Some(local_cfg), None) => Some(local_cfg),
+        (None, Some((_, icloud_cfg))) => Some(icloud_cfg),
+        (None, None) => None,
+    };
+
+    Ok(resolved)
 }
 
 #[tauri::command]
@@ -288,12 +324,38 @@ fn save_app_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     };
 
     let hide_dock = config.hide_dock_when_minimized;
+    let icloud_sync = config.icloud_sync;
 
     fs::create_dir_all(parent)
         .map_err(|error| format!("Failed to create config directory: {error}"))?;
     let raw = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("Failed to serialize config file: {error}"))?;
-    fs::write(&path, raw).map_err(|error| format!("Failed to write config file: {error}"))?;
+
+    // This Mac's last-known mtime, captured before we overwrite it, used to avoid
+    // clobbering a newer iCloud copy written by another Mac.
+    let local_baseline = fs::metadata(&path).and_then(|m| m.modified()).ok();
+    fs::write(&path, &raw).map_err(|error| format!("Failed to write config file: {error}"))?;
+
+    // Mirror into iCloud Drive when sync is on (best-effort; ignore failures so a
+    // missing/locked iCloud folder never blocks a local save). Never overwrite an
+    // iCloud copy that is newer than this Mac's previous state — that copy came
+    // from another Mac and would otherwise be silently lost.
+    if icloud_sync {
+        if let Some(icloud_path) = icloud_config_path(&app) {
+            let icloud_time = fs::metadata(&icloud_path).and_then(|m| m.modified()).ok();
+            let icloud_is_newer = match (icloud_time, local_baseline) {
+                (Some(remote), Some(base)) => remote > base,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if !icloud_is_newer {
+                if let Some(icloud_parent) = icloud_path.parent() {
+                    let _ = fs::create_dir_all(icloud_parent);
+                }
+                let _ = fs::write(&icloud_path, &raw);
+            }
+        }
+    }
 
     *app.state::<AppState>().hide_dock.lock().unwrap() = hide_dock;
 
@@ -329,6 +391,137 @@ fn minimize_main_window(app: AppHandle, hide_dock: bool) -> Result<(), String> {
         .map_err(|error| format!("Failed to minimize window: {error}"))?;
 
     Ok(())
+}
+
+/// Bundle identifier reused for the app identity and the launch-at-login
+/// LaunchAgent label.
+const BUNDLE_IDENTIFIER: &str = "app.workneat.desktop";
+
+/// Path to the per-user LaunchAgent plist that powers "launch at login".
+///
+/// We manage a LaunchAgent directly (instead of pulling in an autostart crate)
+/// so the feature stays dependency-free and offline-installable. macOS runs any
+/// `RunAtLoad` agent in `~/Library/LaunchAgents` at user login.
+fn launch_agent_plist_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app
+        .path()
+        .home_dir()
+        .map_err(|error| format!("Failed to resolve home directory: {error}"))?;
+
+    Ok(home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{BUNDLE_IDENTIFIER}.plist")))
+}
+
+#[tauri::command]
+fn is_launch_at_login_enabled(app: AppHandle) -> bool {
+    launch_agent_plist_path(&app)
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn set_launch_at_login(app: AppHandle, enable: bool) -> Result<(), String> {
+    let path = launch_agent_plist_path(&app)?;
+
+    if !enable {
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("Failed to remove login item: {error}"))?;
+        }
+        return Ok(());
+    }
+
+    let Some(parent) = path.parent() else {
+        return Err("Unable to resolve LaunchAgents directory.".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Failed to create LaunchAgents directory: {error}"))?;
+
+    let executable = env::current_exe()
+        .map(path_to_string)
+        .map_err(|error| format!("Failed to resolve executable path: {error}"))?;
+
+    // The `--autostart` flag lets the app recognise a login launch and tuck
+    // itself into the menu bar when menu-bar mode is enabled.
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>--autostart</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
+"#,
+        label = BUNDLE_IDENTIFIER,
+        exe = xml_escape(&executable),
+    );
+
+    fs::write(&path, plist).map_err(|error| format!("Failed to write login item: {error}"))?;
+
+    Ok(())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Path to the layout config inside iCloud Drive. Returns None when iCloud
+/// Drive isn't available (the user isn't signed in / hasn't enabled it).
+fn icloud_config_path(app: &AppHandle) -> Option<PathBuf> {
+    let home = app.path().home_dir().ok()?;
+    let base = home
+        .join("Library")
+        .join("Mobile Documents")
+        .join("com~apple~CloudDocs");
+    if !base.exists() {
+        return None;
+    }
+
+    Some(base.join("WorkNeat").join("workneat-config.json"))
+}
+
+fn read_config_at(path: &PathBuf) -> Option<AppConfig> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str::<AppConfig>(&raw).ok()
+}
+
+fn file_is_newer(candidate: &PathBuf, baseline: &PathBuf) -> bool {
+    let candidate_time = fs::metadata(candidate).and_then(|m| m.modified()).ok();
+    let baseline_time = fs::metadata(baseline).and_then(|m| m.modified()).ok();
+    match (candidate_time, baseline_time) {
+        (Some(a), Some(b)) => a > b,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+/// Writes user-chosen JSON to an arbitrary path (layout export).
+#[tauri::command]
+fn export_config(path: String, contents: String) -> Result<(), String> {
+    fs::write(&path, contents).map_err(|error| format!("Failed to export layouts: {error}"))
+}
+
+/// Reads JSON from an arbitrary path (layout import).
+#[tauri::command]
+fn import_config(path: String) -> Result<String, String> {
+    fs::read_to_string(&path).map_err(|error| format!("Failed to read file: {error}"))
 }
 
 fn app_config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -368,7 +561,7 @@ fn current_app_identity() -> AppIdentity {
         .unwrap_or_default();
 
     AppIdentity {
-        bundle_identifier: "app.workneat.desktop".to_string(),
+        bundle_identifier: BUNDLE_IDENTIFIER.to_string(),
         bundle_path,
         executable_path,
     }
@@ -541,15 +734,28 @@ fn list_window_sources(app: AppHandle) -> Result<Vec<AppSource>, String> {
         .collect())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyResult {
+    moved_windows: usize,
+    /// Apps that had placements but no window could be moved (e.g. the window is
+    /// on another Space, minimized to a different desktop, or the app isn't
+    /// running). Surfaced to the user so failures aren't silent.
+    unmoved_apps: Vec<String>,
+}
+
 #[tauri::command]
-fn apply_workspace_profile(app: AppHandle, profile: WorkspaceProfile) -> Result<String, String> {
+fn apply_workspace_profile(app: AppHandle, profile: WorkspaceProfile) -> Result<ApplyResult, String> {
     apply_profile_internal(&app, &profile)
 }
 
 /// Core layout-application routine shared by the IPC command, the global-shortcut
 /// handler, and the tray menu. It prefers the direct Accessibility (AX) path and
 /// only falls back to the slower AppleScript path when no window could be moved.
-fn apply_profile_internal(app: &AppHandle, profile: &WorkspaceProfile) -> Result<String, String> {
+fn apply_profile_internal(
+    app: &AppHandle,
+    profile: &WorkspaceProfile,
+) -> Result<ApplyResult, String> {
     if !matches!(accessibility_status(), PermissionStatus::Granted) {
         return Err("Accessibility permission is required to apply layouts.".to_string());
     }
@@ -564,13 +770,23 @@ fn apply_profile_internal(app: &AppHandle, profile: &WorkspaceProfile) -> Result
         thread::sleep(Duration::from_millis(250));
     }
 
-    let moved_windows = apply_profile_with_accessibility(profile, &displays)?;
+    let (moved_windows, unmoved_apps) = apply_profile_with_accessibility(profile, &displays)?;
     if moved_windows == 0 {
+        // Nothing responded to the direct Accessibility path — fall back to the
+        // AppleScript/System Events path for the whole layout. Per-app failures
+        // can't be reliably attributed after the fallback, so report none.
         let script = build_apply_script(profile, &displays)?;
         run_applescript(&script)?;
+        return Ok(ApplyResult {
+            moved_windows: 0,
+            unmoved_apps: Vec::new(),
+        });
     }
 
-    Ok(format!("Applied layout {}", profile.name))
+    Ok(ApplyResult {
+        moved_windows,
+        unmoved_apps,
+    })
 }
 
 /// Registers every profile hotkey directly on the backend and records the
@@ -1212,7 +1428,7 @@ fn launch_requested_apps(profile: &WorkspaceProfile) -> Result<bool, String> {
 fn apply_profile_with_accessibility(
     profile: &WorkspaceProfile,
     displays: &[DisplayDescriptor],
-) -> Result<usize, String> {
+) -> Result<(usize, Vec<String>), String> {
     let windows = capture_visible_windows()?;
     let mut app_pids: BTreeMap<String, Vec<i32>> = BTreeMap::new();
 
@@ -1233,25 +1449,34 @@ fn apply_profile_with_accessibility(
     }
 
     let mut moved_windows = 0;
+    let mut unmoved_apps: Vec<String> = Vec::new();
     for rule in profile.app_rules.iter().rev() {
+        if rule.placements.is_empty() {
+            continue;
+        }
+
         let pids = app_pids
             .get(&app_lookup_key(&rule.bundle_identifier))
             .or_else(|| app_pids.get(&app_lookup_key(&rule.app_name)));
 
-        let Some(pids) = pids else {
-            continue;
-        };
-
-        for pid in pids {
-            let moved_for_pid = move_ax_windows_for_pid(*pid, &rule.placements, displays);
-            moved_windows += moved_for_pid;
-            if moved_for_pid > 0 {
-                break;
+        let mut moved_for_rule = 0;
+        if let Some(pids) = pids {
+            for pid in pids {
+                let moved_for_pid = move_ax_windows_for_pid(*pid, &rule.placements, displays);
+                moved_for_rule += moved_for_pid;
+                if moved_for_pid > 0 {
+                    break;
+                }
             }
+        }
+
+        moved_windows += moved_for_rule;
+        if moved_for_rule == 0 && !unmoved_apps.contains(&rule.app_name) {
+            unmoved_apps.push(rule.app_name.clone());
         }
     }
 
-    Ok(moved_windows)
+    Ok((moved_windows, unmoved_apps))
 }
 
 fn move_ax_windows_for_pid(
@@ -1624,6 +1849,15 @@ fn now_seconds() -> u64 {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must be the first plugin: when a second launch happens while WorkNeat
+        // is already running (e.g. hidden in the menu bar), focus the existing
+        // window instead of spawning a duplicate.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -1649,7 +1883,19 @@ pub fn run() {
         .manage(AppState::default())
         .setup(|app| {
             let handle = app.handle();
-            *handle.state::<AppState>().hide_dock.lock().unwrap() = stored_hide_dock(handle);
+            let hide_dock = stored_hide_dock(handle);
+            *handle.state::<AppState>().hide_dock.lock().unwrap() = hide_dock;
+
+            // When macOS launches us at login (via the LaunchAgent's `--autostart`
+            // flag) and menu-bar mode is on, start hidden in the menu bar instead
+            // of popping the window in the user's face.
+            let launched_at_login = std::env::args().any(|arg| arg == "--autostart");
+            if launched_at_login && hide_dock {
+                if let Some(window) = handle.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                let _ = handle.set_activation_policy(ActivationPolicy::Accessory);
+            }
 
             let menu = build_tray_menu(handle, &[])?;
             let tray = TrayIconBuilder::with_id("workneat-tray")
@@ -1702,10 +1948,21 @@ pub fn run() {
             open_accessibility_settings,
             capture_current_layout,
             list_window_sources,
-            apply_workspace_profile
+            apply_workspace_profile,
+            is_launch_at_login_enabled,
+            set_launch_at_login,
+            export_config,
+            import_config
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run WorkNeat");
+        .build(tauri::generate_context!())
+        .expect("failed to build WorkNeat")
+        .run(|app, event| {
+            // macOS sends Reopen when the user re-launches or clicks the app
+            // icon while it is already running — bring the main window back.
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_main_window(app);
+            }
+        });
 }
 
 fn main() {

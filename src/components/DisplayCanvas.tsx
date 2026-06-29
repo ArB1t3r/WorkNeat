@@ -19,6 +19,8 @@ interface DisplayCanvasProps {
   selectedPlacementId: string | null;
   activeDisplayId: string;
   snapToGrid: boolean;
+  gridColumns: number;
+  gridRows: number;
   onSelectPlacement: (placementId: string) => void;
   onActivateDisplay: (displayId: string) => void;
   onUpdatePlacement: (placementId: string, frame: RelativeFrame) => void;
@@ -44,8 +46,6 @@ function getDisplayScale(displays: DisplayDescriptor[]): DisplayScale {
   return { minX, minY, width, height, scale };
 }
 
-const gridDivisions = 12;
-
 function clampFrame(frame: RelativeFrame): RelativeFrame {
   const width = Math.min(Math.max(frame.width, 0.12), 1);
   const height = Math.min(Math.max(frame.height, 0.12), 1);
@@ -57,31 +57,36 @@ function clampFrame(frame: RelativeFrame): RelativeFrame {
   };
 }
 
-function snapToGridLine(value: number): number {
-  return Math.round(value * gridDivisions) / gridDivisions;
+function snapToLine(value: number, divisions: number): number {
+  return Math.round(value * divisions) / divisions;
 }
 
-function snapPosition(value: number, size: number): number {
+function snapPosition(value: number, size: number, divisions: number): number {
   const max = Math.max(0, 1 - size);
-  const snapped = snapToGridLine(value);
+  const snapped = snapToLine(value, divisions);
   if (snapped <= max) return Math.max(0, snapped);
 
-  return Math.floor(max * gridDivisions) / gridDivisions;
+  return Math.floor(max * divisions) / divisions;
 }
 
-function snapFrame(frame: RelativeFrame, mode: "move" | "resize"): RelativeFrame {
+function snapFrame(
+  frame: RelativeFrame,
+  mode: "move" | "resize",
+  columns: number,
+  rows: number,
+): RelativeFrame {
   if (mode === "move") {
     return clampFrame({
       ...frame,
-      x: snapPosition(frame.x, frame.width),
-      y: snapPosition(frame.y, frame.height),
+      x: snapPosition(frame.x, frame.width, columns),
+      y: snapPosition(frame.y, frame.height, rows),
     });
   }
 
   return clampFrame({
     ...frame,
-    width: snapToGridLine(frame.x + frame.width) - frame.x,
-    height: snapToGridLine(frame.y + frame.height) - frame.y,
+    width: snapToLine(frame.x + frame.width, columns) - frame.x,
+    height: snapToLine(frame.y + frame.height, rows) - frame.y,
   });
 }
 
@@ -95,6 +100,8 @@ export function DisplayCanvas({
   selectedPlacementId,
   activeDisplayId,
   snapToGrid,
+  gridColumns,
+  gridRows,
   onSelectPlacement,
   onActivateDisplay,
   onUpdatePlacement,
@@ -155,15 +162,16 @@ export function DisplayCanvas({
     window.addEventListener("pointerup", end);
 
     function applyGrid(frame: RelativeFrame) {
-      return snapToGrid ? snapFrame(frame, mode) : clampFrame(frame);
+      return snapToGrid ? snapFrame(frame, mode, gridColumns, gridRows) : clampFrame(frame);
     }
   }
 
   return (
     <main className="canvas-shell">
       <div className="canvas-toolbar">
-        <Chip radius="sm" variant="flat" startContent={<MousePointer2 size={14} />}>
-          Drag windows and resize from the lower-right handle
+        <Chip size="sm" variant="secondary">
+          <MousePointer2 size={14} />
+          <Chip.Label>Drag windows and resize from the lower-right handle</Chip.Label>
         </Chip>
         <span>{profile.displaySetSignature}</span>
       </div>
@@ -204,7 +212,14 @@ export function DisplayCanvas({
               style={{ left, top, width, height }}
               tabIndex={0}
             >
-              {isDragging ? <div className="display-grid" /> : null}
+              {isDragging ? (
+                <div
+                  className="display-grid"
+                  style={{
+                    backgroundSize: `calc(100% / ${gridColumns}) calc(100% / ${gridRows})`,
+                  }}
+                />
+              ) : null}
               <div className="display-label">
                 <strong>{display.identity.name}</strong>
                 <span>

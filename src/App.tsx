@@ -1,13 +1,27 @@
-import { useEffect, useMemo, useState } from "react";
-import type { AppRule, AppSource, RelativeFrame, RuntimeSnapshot, WorkspaceProfile } from "./types/layout";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "@heroui/react";
+import type {
+  AppConfig,
+  AppRule,
+  AppSource,
+  RelativeFrame,
+  RuntimeSnapshot,
+  ThemeMode,
+  WorkspaceProfile,
+} from "./types/layout";
 import { DisplayCanvas } from "./components/DisplayCanvas";
 import { Inspector } from "./components/Inspector";
+import { MoveWarningDialog } from "./components/MoveWarningDialog";
 import { PermissionGate } from "./components/PermissionGate";
+import { SettingsSheet } from "./components/SettingsSheet";
 import { Sidebar } from "./components/Sidebar";
 import { TopBar } from "./components/TopBar";
 import {
   applyWorkspaceProfile,
+  exportConfigToFile,
   getRuntimeSnapshot,
+  importConfigFromFile,
+  isLaunchAtLoginEnabled,
   loadAppConfig,
   listWindowSources,
   minimizeMainWindow,
@@ -16,8 +30,11 @@ import {
   revealCurrentAppInFinder,
   requestAccessibilityPermission,
   saveAppConfig,
+  setLaunchAtLogin as setLaunchAtLoginItem,
 } from "./lib/tauri";
 import { createAppConfig, loadLocalConfig, saveLocalConfig } from "./lib/storage";
+import { applyThemeMode, loadThemeMode, watchSystemAppearance } from "./lib/theme";
+import { checkForUpdate } from "./lib/updater";
 import { mockRuntime } from "./lib/mockData";
 import {
   ensureUniqueProfileHotkeys,
@@ -28,17 +45,20 @@ import {
 import type { AppIconId } from "./types/layout";
 import type { DisplayDescriptor } from "./types/layout";
 
+const APP_VERSION = "0.1.0";
+
 function makeId(prefix: string) {
   return `${prefix}-${Math.random().toString(36).slice(2, 9)}`;
 }
 
-function configFingerprint(
-  profiles: WorkspaceProfile[],
-  appIconId: AppIconId,
-  hideDockWhenMinimized: boolean,
-  snapToGrid: boolean,
-) {
-  return JSON.stringify(createAppConfig(profiles, appIconId, hideDockWhenMinimized, snapToGrid));
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function configFingerprint(profiles: WorkspaceProfile[]) {
+  // Only the layout (profiles) drives the unsaved-changes indicator. App
+  // preferences persist immediately, so they must never mark the layout dirty.
+  return JSON.stringify(createAppConfig({ profiles }).profiles);
 }
 
 function createProfile(displaySetSignature: string, profiles: WorkspaceProfile[]): WorkspaceProfile {
@@ -298,18 +318,29 @@ export default function App() {
     initialConfig.hideDockWhenMinimized,
   );
   const [snapToGrid, setSnapToGrid] = useState(initialConfig.snapToGrid);
+  const [theme, setTheme] = useState<ThemeMode>(() => loadThemeMode());
+  const [launchAtLogin, setLaunchAtLogin] = useState(false);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [gridColumns, setGridColumns] = useState(initialConfig.gridColumns);
+  const [gridRows, setGridRows] = useState(initialConfig.gridRows);
+  const [suppressMoveWarnings, setSuppressMoveWarnings] = useState(
+    initialConfig.suppressMoveWarnings,
+  );
+  const [icloudSync, setIcloudSync] = useState(initialConfig.icloudSync);
+  const [moveWarningApps, setMoveWarningApps] = useState<string[] | null>(null);
   const [savedConfigFingerprint, setSavedConfigFingerprint] = useState(() =>
-    configFingerprint(
-      initialConfig.profiles,
-      initialConfig.appIconId,
-      initialConfig.hideDockWhenMinimized,
-      initialConfig.snapToGrid,
-    ),
+    configFingerprint(initialConfig.profiles),
   );
   const [shortcutFailures, setShortcutFailures] = useState<string[]>([]);
   const [activeProfileId, setActiveProfileId] = useState(initialConfig.profiles[0]?.id ?? "");
   const [appSources, setAppSources] = useState<AppSource[]>([]);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const notify = (message: string) => toast(message);
+  const themeRef = useRef(theme);
+  themeRef.current = theme;
+  // The last layout that was actually persisted, plus a guard so preference
+  // writes never run before the on-disk/iCloud config has loaded.
+  const savedProfilesRef = useRef(initialConfig.profiles);
+  const configLoadedRef = useRef(false);
   const [selectedPlacementId, setSelectedPlacementId] = useState<string | null>(
     profiles[0]?.appRules[0]?.placements[0]?.id ?? null,
   );
@@ -321,49 +352,92 @@ export default function App() {
     () => profiles.find((profile) => profile.id === activeProfileId) ?? profiles[0],
     [activeProfileId, profiles],
   );
-  const currentConfigFingerprint = useMemo(
-    () => configFingerprint(profiles, appIconId, hideDockWhenMinimized, snapToGrid),
-    [appIconId, hideDockWhenMinimized, profiles, snapToGrid],
-  );
+  const currentConfigFingerprint = useMemo(() => configFingerprint(profiles), [profiles]);
   const hasUnsavedChanges = currentConfigFingerprint !== savedConfigFingerprint;
   const activeDisplay = runtime.displays.find((display) => display.identity.id === activeDisplayId);
   const activeDisplayName = activeDisplay?.identity.name ?? "display";
 
   useEffect(() => {
-    getRuntimeSnapshot().then(setRuntime);
-    listWindowSources().then(setAppSources);
+    let cancelled = false;
 
-    loadAppConfig().then((config) => {
-      if (config) {
-        const hydratedConfig = createAppConfig(
-          config.profiles,
-          config.appIconId,
-          config.hideDockWhenMinimized,
-          config.snapToGrid,
-        );
-        const nextProfiles = hydratedConfig.profiles;
-        setProfiles(nextProfiles);
-        setAppIconId(hydratedConfig.appIconId);
-        setHideDockWhenMinimized(hydratedConfig.hideDockWhenMinimized);
-        setSnapToGrid(hydratedConfig.snapToGrid);
-        setSavedConfigFingerprint(
-          configFingerprint(
-            nextProfiles,
-            hydratedConfig.appIconId,
-            hydratedConfig.hideDockWhenMinimized,
-            hydratedConfig.snapToGrid,
-          ),
-        );
-        setActiveProfileId((current) =>
-          nextProfiles.some((profile) => profile.id === current)
-            ? current
-            : (nextProfiles[0]?.id ?? ""),
-        );
-        const nextPlacement = nextProfiles[0]?.appRules[0]?.placements[0] ?? null;
-        setSelectedPlacementId(nextPlacement?.id ?? null);
-        setActiveDisplayId(nextPlacement?.displayId ?? runtime.displays[0]?.identity.id ?? "");
+    (async () => {
+      // Fetch everything up front so the persisted layout can be reconciled
+      // against the *current* display snapshot — not a stale closure — before it
+      // is stored. This avoids a startup race where restored placements keep
+      // display ids that no longer exist after the monitor set changed.
+      const [snapshot, sources, launchEnabled, config] = await Promise.all([
+        getRuntimeSnapshot(),
+        listWindowSources(),
+        isLaunchAtLoginEnabled(),
+        loadAppConfig(),
+      ]);
+      if (cancelled) return;
+
+      setRuntime(snapshot);
+      setAppSources(sources);
+      setLaunchAtLogin(launchEnabled);
+      configLoadedRef.current = true;
+      if (!config) return;
+
+      const hydratedConfig = createAppConfig({
+        profiles: config.profiles,
+        appIconId: config.appIconId,
+        hideDockWhenMinimized: config.hideDockWhenMinimized,
+        snapToGrid: config.snapToGrid,
+      });
+      const nextProfiles = hydratedConfig.profiles.map((profile) =>
+        reconcileProfileDisplays(profile, snapshot),
+      );
+      setProfiles(nextProfiles);
+      savedProfilesRef.current = nextProfiles;
+      setAppIconId(hydratedConfig.appIconId);
+      setHideDockWhenMinimized(hydratedConfig.hideDockWhenMinimized);
+      setSnapToGrid(hydratedConfig.snapToGrid);
+      setGridColumns(config.gridColumns);
+      setGridRows(config.gridRows);
+      setSuppressMoveWarnings(config.suppressMoveWarnings);
+      setIcloudSync(config.icloudSync);
+      // Fingerprint the reconciled profiles so a display-driven correction does
+      // not surface as phantom unsaved changes.
+      setSavedConfigFingerprint(configFingerprint(nextProfiles));
+      setActiveProfileId((current) =>
+        nextProfiles.some((profile) => profile.id === current)
+          ? current
+          : (nextProfiles[0]?.id ?? ""),
+      );
+      const nextPlacement = nextProfiles[0]?.appRules[0]?.placements[0] ?? null;
+      setSelectedPlacementId(nextPlacement?.id ?? null);
+      setActiveDisplayId(
+        nextPlacement && snapshot.displays.some((d) => d.identity.id === nextPlacement.displayId)
+          ? nextPlacement.displayId
+          : (snapshot.displays[0]?.identity.id ?? ""),
+      );
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Keep the document appearance in sync with the chosen theme; the watcher
+  // re-applies live when the OS appearance changes while in "system" mode.
+  useEffect(() => {
+    applyThemeMode({ mode: theme });
+  }, [theme]);
+
+  useEffect(() => watchSystemAppearance({ getMode: () => themeRef.current }), []);
+
+  // ⌘, opens the unified Settings sheet, matching the macOS convention.
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+        event.preventDefault();
+        setIsSettingsOpen(true);
       }
-    });
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
   useEffect(() => {
@@ -387,7 +461,7 @@ export default function App() {
     registerProfileShortcuts(ensureUniqueProfileHotkeys(profiles)).then((failures) => {
       setShortcutFailures(failures);
       if (failures.length > 0) {
-        setStatusMessage(`Shortcut unavailable: ${failures.join(", ")}`);
+        notify(`Shortcut unavailable: ${failures.join(", ")}`);
       }
     });
   }, [profiles]);
@@ -420,24 +494,255 @@ export default function App() {
     replaceActiveProfile(updateRule(activeProfile, applyStack(rule)));
   }
 
+  // Persist preferences + the current layout to disk and the backend right
+  // away. saveAppConfig also syncs the backend's menu-bar state, so toggling
+  // "Run from the menu bar" takes effect on the very next window close.
+  async function persistConfig(
+    overrides: Partial<{
+      appIconId: AppIconId;
+      hideDockWhenMinimized: boolean;
+      snapToGrid: boolean;
+      theme: ThemeMode;
+      launchAtLogin: boolean;
+      gridColumns: number;
+      gridRows: number;
+      suppressMoveWarnings: boolean;
+      icloudSync: boolean;
+    }> = {},
+  ) {
+    // Skip until the initial load finished (avoids overwriting newer disk/iCloud
+    // data during the mount race), and persist the LAST SAVED layout — never the
+    // possibly half-edited in-memory profiles — so a settings toggle can't
+    // silently commit a draft layout.
+    if (!configLoadedRef.current) return;
+
+    const config = createAppConfig({
+      profiles: savedProfilesRef.current,
+      appIconId: overrides.appIconId ?? appIconId,
+      hideDockWhenMinimized: overrides.hideDockWhenMinimized ?? hideDockWhenMinimized,
+      snapToGrid: overrides.snapToGrid ?? snapToGrid,
+      theme: overrides.theme ?? theme,
+      launchAtLogin: overrides.launchAtLogin ?? launchAtLogin,
+      gridColumns: overrides.gridColumns ?? gridColumns,
+      gridRows: overrides.gridRows ?? gridRows,
+      suppressMoveWarnings: overrides.suppressMoveWarnings ?? suppressMoveWarnings,
+      icloudSync: overrides.icloudSync ?? icloudSync,
+    });
+    saveLocalConfig(config);
+    await saveAppConfig(config);
+  }
+
+  /** Replaces all in-memory layout + preference state from a loaded config. */
+  function adoptConfig(config: AppConfig) {
+    setProfiles(config.profiles);
+    setAppIconId(config.appIconId);
+    setHideDockWhenMinimized(config.hideDockWhenMinimized);
+    setSnapToGrid(config.snapToGrid);
+    setGridColumns(config.gridColumns);
+    setGridRows(config.gridRows);
+    setSuppressMoveWarnings(config.suppressMoveWarnings);
+    applyThemeMode({ mode: config.theme });
+    setTheme(config.theme);
+    savedProfilesRef.current = config.profiles;
+    setSavedConfigFingerprint(configFingerprint(config.profiles));
+
+    const firstProfile = config.profiles[0] ?? null;
+    const firstPlacement = firstProfile?.appRules[0]?.placements[0] ?? null;
+    setActiveProfileId(firstProfile?.id ?? "");
+    setSelectedPlacementId(firstPlacement?.id ?? null);
+    setActiveDisplayId(firstPlacement?.displayId ?? runtime.displays[0]?.identity.id ?? "");
+  }
+
   function handleAppIconChange(nextIconId: AppIconId) {
     setAppIconId(nextIconId);
-    setStatusMessage("Updated app icon style.");
+    void persistConfig({ appIconId: nextIconId });
+  }
+
+  function handleSnapToGridChange(nextEnabled: boolean) {
+    setSnapToGrid(nextEnabled);
+    void persistConfig({ snapToGrid: nextEnabled });
+  }
+
+  function handleHideDockChange(nextEnabled: boolean) {
+    setHideDockWhenMinimized(nextEnabled);
+    void persistConfig({ hideDockWhenMinimized: nextEnabled });
+  }
+
+  function handleThemeChange(nextTheme: ThemeMode) {
+    applyThemeMode({ mode: nextTheme });
+    setTheme(nextTheme);
+    void persistConfig({ theme: nextTheme });
+  }
+
+  async function handleLaunchAtLoginChange(nextEnabled: boolean) {
+    try {
+      await setLaunchAtLoginItem(nextEnabled);
+      setLaunchAtLogin(nextEnabled);
+      void persistConfig({ launchAtLogin: nextEnabled });
+      notify(
+        nextEnabled ? "WorkNeat will launch at login." : "Removed WorkNeat from login items.",
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      toast.danger(`Could not update login item: ${message}`);
+    }
+  }
+
+  function handleDeleteProfile(profileId: string) {
+    if (profiles.length <= 1) {
+      notify("Keep at least one layout.");
+      return;
+    }
+
+    const remaining = profiles.filter((profile) => profile.id !== profileId);
+    setProfiles(remaining);
+
+    if (activeProfileId === profileId) {
+      const nextProfile = remaining[0];
+      const nextPlacement = nextProfile?.appRules[0]?.placements[0] ?? null;
+      setActiveProfileId(nextProfile?.id ?? "");
+      setSelectedPlacementId(nextPlacement?.id ?? null);
+      setActiveDisplayId(nextPlacement?.displayId ?? runtime.displays[0]?.identity.id ?? "");
+    }
+
+    notify("Layout deleted.");
+  }
+
+  function handleGridChange({ columns, rows }: { columns: number; rows: number }) {
+    setGridColumns(columns);
+    setGridRows(rows);
+    void persistConfig({ gridColumns: columns, gridRows: rows });
+  }
+
+  function handleSuppressMoveWarningsChange(nextValue: boolean) {
+    setSuppressMoveWarnings(nextValue);
+    void persistConfig({ suppressMoveWarnings: nextValue });
+  }
+
+  async function handleIcloudSyncChange(nextValue: boolean) {
+    setIcloudSync(nextValue);
+    try {
+      await persistConfig({ icloudSync: nextValue });
+      if (nextValue) {
+        // Pull in iCloud's copy when it is newer than this Mac's, instead of
+        // letting the local layout silently win. The backend write above already
+        // refuses to clobber a newer iCloud copy.
+        const reconciled = await loadAppConfig();
+        if (reconciled) adoptConfig(reconciled);
+      }
+      notify(nextValue ? "iCloud sync enabled." : "iCloud sync disabled.");
+    } catch (error) {
+      toast.danger(`Could not update iCloud sync: ${errorMessage(error)}`);
+    }
+  }
+
+  function handleMoveWarningDismiss(suppressFuture: boolean) {
+    setMoveWarningApps(null);
+    if (suppressFuture) {
+      setSuppressMoveWarnings(true);
+      void persistConfig({ suppressMoveWarnings: true });
+    }
+  }
+
+  async function handleExportLayouts() {
+    try {
+      const config = createAppConfig({
+        profiles,
+        appIconId,
+        hideDockWhenMinimized,
+        snapToGrid,
+        theme,
+        launchAtLogin,
+        gridColumns,
+        gridRows,
+        suppressMoveWarnings,
+        icloudSync,
+      });
+      const exported = await exportConfigToFile(JSON.stringify(config, null, 2));
+      if (exported) notify("Layouts exported.");
+    } catch (error) {
+      toast.danger(`Export failed: ${errorMessage(error)}`);
+    }
+  }
+
+  async function handleImportLayouts() {
+    try {
+      const raw = await importConfigFromFile();
+      if (!raw) return;
+
+      const parsed = JSON.parse(raw) as Partial<AppConfig>;
+      // Keep machine-specific prefs (login item, iCloud) local; import the rest.
+      const imported = createAppConfig({
+        profiles: parsed.profiles ?? [],
+        appIconId: parsed.appIconId,
+        hideDockWhenMinimized: parsed.hideDockWhenMinimized,
+        snapToGrid: parsed.snapToGrid,
+        theme: parsed.theme,
+        launchAtLogin,
+        gridColumns: parsed.gridColumns,
+        gridRows: parsed.gridRows,
+        suppressMoveWarnings: parsed.suppressMoveWarnings,
+        icloudSync,
+      });
+
+      setProfiles(imported.profiles);
+      savedProfilesRef.current = imported.profiles;
+      setAppIconId(imported.appIconId);
+      setHideDockWhenMinimized(imported.hideDockWhenMinimized);
+      setSnapToGrid(imported.snapToGrid);
+      setGridColumns(imported.gridColumns);
+      setGridRows(imported.gridRows);
+      setSuppressMoveWarnings(imported.suppressMoveWarnings);
+      applyThemeMode({ mode: imported.theme });
+      setTheme(imported.theme);
+
+      const firstProfile = imported.profiles[0] ?? null;
+      const firstPlacement = firstProfile?.appRules[0]?.placements[0] ?? null;
+      setActiveProfileId(firstProfile?.id ?? "");
+      setSelectedPlacementId(firstPlacement?.id ?? null);
+      setActiveDisplayId(firstPlacement?.displayId ?? runtime.displays[0]?.identity.id ?? "");
+
+      saveLocalConfig(imported);
+      await saveAppConfig(imported);
+      setSavedConfigFingerprint(configFingerprint(imported.profiles));
+      notify(`Imported ${imported.profiles.length} layouts.`);
+    } catch (error) {
+      toast.danger(`Import failed: ${errorMessage(error)}`);
+    }
+  }
+
+  async function handleCheckForUpdates() {
+    try {
+      const result = await checkForUpdate();
+      if (!result.available) {
+        notify("You're on the latest version.");
+        return;
+      }
+
+      toast(`Update ${result.version} available`, {
+        description: "Download and install now?",
+        timeout: 0,
+        actionProps: {
+          children: "Install & Restart",
+          onPress: async () => {
+            try {
+              await result.install();
+            } catch (error) {
+              toast.danger(`Update install failed: ${errorMessage(error)}`);
+            }
+          },
+        },
+      });
+    } catch (error) {
+      toast.danger(`Update check failed: ${errorMessage(error)}`);
+    }
   }
 
   async function handleSaveLayout() {
-    const config = createAppConfig(profiles, appIconId, hideDockWhenMinimized, snapToGrid);
-    saveLocalConfig(config);
-    await saveAppConfig(config);
-    setSavedConfigFingerprint(
-      configFingerprint(
-        config.profiles,
-        config.appIconId,
-        config.hideDockWhenMinimized,
-        config.snapToGrid,
-      ),
-    );
-    setStatusMessage(`Saved ${activeProfile.name} locally.`);
+    savedProfilesRef.current = profiles;
+    await persistConfig();
+    setSavedConfigFingerprint(configFingerprint(profiles));
+    notify(`Saved ${activeProfile.name} locally.`);
   }
 
   async function handleMinimizeApp() {
@@ -450,7 +755,7 @@ export default function App() {
     position: "before" | "after",
   ) {
     replaceActiveProfile(reorderAppRule(activeProfile, draggedRuleId, targetRuleId, position));
-    setStatusMessage("Updated front-to-back layer order.");
+    notify("Updated front-to-back layer order.");
   }
 
   function handleMovePlacementToDisplay(placementId: string, displayId: string) {
@@ -491,7 +796,7 @@ export default function App() {
         }));
 
       if (nextPlacements.length === 0) {
-        setStatusMessage(`${source.appName} is already in this display group.`);
+        notify(`${source.appName} is already in this display group.`);
         return;
       }
 
@@ -502,7 +807,7 @@ export default function App() {
         }),
       );
       setSelectedPlacementId(nextPlacements[0]?.id ?? null);
-      setStatusMessage(`Added ${source.appName} windows from this display.`);
+      notify(`Added ${source.appName} windows from this display.`);
       return;
     }
 
@@ -544,7 +849,7 @@ export default function App() {
       appRules: [...activeProfile.appRules, nextRule],
     });
     setSelectedPlacementId(placements[0]?.id ?? null);
-    setStatusMessage(`Added ${source.appName}. Mirror will refresh its current frames.`);
+    notify(`Added ${source.appName}. Mirror will refresh its current frames.`);
   }
 
   function handleAddWindow(ruleId: string) {
@@ -596,12 +901,12 @@ export default function App() {
 
   async function handleMirror() {
     if (runtime.accessibility === "missing") {
-      setStatusMessage("Grant Accessibility before mirroring current positions.");
+      notify("Grant Accessibility before mirroring current positions.");
       return;
     }
 
     if (activeProfile.appRules.length === 0) {
-      setStatusMessage("Add apps to this layout before mirroring.");
+      notify("Add apps to this layout before mirroring.");
       return;
     }
 
@@ -627,9 +932,9 @@ export default function App() {
     );
 
     if (mirrored.mirroredWindows === 0) {
-      setStatusMessage(`No tracked app windows are visible on ${mirrorDisplayName}.`);
+      notify(`No tracked app windows are visible on ${mirrorDisplayName}.`);
     } else {
-      setStatusMessage(
+      notify(
         `Mirrored ${mirrored.mirroredWindows} windows from ${mirrored.mirroredApps} tracked apps on ${mirrorDisplayName}.`,
       );
     }
@@ -637,19 +942,29 @@ export default function App() {
 
   async function handleApply() {
     if (runtime.accessibility === "missing") {
-      setStatusMessage("Grant Accessibility before applying layouts.");
+      notify("Grant Accessibility before applying layouts.");
       return;
     }
 
-    await applyWorkspaceProfile(activeProfile);
-    setStatusMessage(`Applied ${activeProfile.name}.`);
+    try {
+      const result = await applyWorkspaceProfile(activeProfile);
+      if (result.movedWindows === 0) {
+        notify(`Applied ${activeProfile.name} — couldn't confirm any window moved.`);
+      } else if (result.unmovedApps.length > 0 && !suppressMoveWarnings) {
+        setMoveWarningApps(result.unmovedApps);
+      } else {
+        notify(`Applied ${activeProfile.name}.`);
+      }
+    } catch (error) {
+      toast.danger(`Could not apply layout: ${errorMessage(error)}`);
+    }
   }
 
   async function handleRefreshAppSources() {
     const sources = await listWindowSources();
     setAppSources(sources);
     const windowCount = sources.reduce((sum, source) => sum + source.windowCount, 0);
-    setStatusMessage(`Found ${sources.length} running apps with ${windowCount} visible windows.`);
+    notify(`Found ${sources.length} running apps with ${windowCount} visible windows.`);
   }
 
   if (!activeProfile) {
@@ -677,6 +992,7 @@ export default function App() {
         profiles={profiles}
         activeProfileId={activeProfile.id}
         runtime={runtime}
+        appIconId={appIconId}
         onSelectProfile={(profileId) => {
           const nextProfile = profiles.find((profile) => profile.id === profileId);
           const nextPlacement = nextProfile?.appRules[0]?.placements[0] ?? null;
@@ -691,10 +1007,8 @@ export default function App() {
           setSelectedPlacementId(null);
           setActiveDisplayId(runtime.displays[0]?.identity.id ?? "");
         }}
-        appIconId={appIconId}
-        snapToGrid={snapToGrid}
-        onAppIconChange={handleAppIconChange}
-        onSnapToGridChange={setSnapToGrid}
+        onOpenSettings={() => setIsSettingsOpen(true)}
+        onDeleteProfile={handleDeleteProfile}
       />
 
       <section className="workspace">
@@ -704,7 +1018,7 @@ export default function App() {
           onNameChange={(name) => replaceActiveProfile({ ...activeProfile, name })}
           onHotkeyChange={(hotkey) => {
             if (!isHotkeyAvailable(profiles, hotkey, activeProfile.id)) {
-              setStatusMessage("That hotkey is already used by another layout.");
+              notify("That hotkey is already used by another layout.");
               return;
             }
 
@@ -720,7 +1034,7 @@ export default function App() {
           onApply={handleApply}
           hasUnsavedChanges={hasUnsavedChanges}
           shortcutFailures={shortcutFailures}
-          statusMessage={statusMessage}
+          statusMessage={null}
         />
 
         <div className="workspace-body">
@@ -730,6 +1044,8 @@ export default function App() {
             selectedPlacementId={selectedPlacementId}
             activeDisplayId={activeDisplayId}
             snapToGrid={snapToGrid}
+            gridColumns={gridColumns}
+            gridRows={gridRows}
             onSelectPlacement={handleSelectPlacement}
             onActivateDisplay={setActiveDisplayId}
             onUpdatePlacement={handleUpdatePlacement}
@@ -746,15 +1062,46 @@ export default function App() {
             onDeleteAppRule={handleDeleteAppRule}
             onReorderAppRule={handleReorderAppRule}
             onMovePlacementToDisplay={handleMovePlacementToDisplay}
-            hideDockWhenMinimized={hideDockWhenMinimized}
-            onHideDockWhenMinimizedChange={setHideDockWhenMinimized}
-            onMinimizeApp={handleMinimizeApp}
             appSources={appSources}
             onRefreshAppSources={handleRefreshAppSources}
             onAddAppSource={handleAddAppSource}
           />
         </div>
       </section>
+
+      <SettingsSheet
+        isOpen={isSettingsOpen}
+        onOpenChange={setIsSettingsOpen}
+        runtime={runtime}
+        appVersion={APP_VERSION}
+        theme={theme}
+        onThemeChange={handleThemeChange}
+        appIconId={appIconId}
+        onAppIconChange={handleAppIconChange}
+        hideDockWhenMinimized={hideDockWhenMinimized}
+        onHideDockWhenMinimizedChange={handleHideDockChange}
+        snapToGrid={snapToGrid}
+        onSnapToGridChange={handleSnapToGridChange}
+        gridColumns={gridColumns}
+        gridRows={gridRows}
+        onGridChange={handleGridChange}
+        suppressMoveWarnings={suppressMoveWarnings}
+        onSuppressMoveWarningsChange={handleSuppressMoveWarningsChange}
+        launchAtLogin={launchAtLogin}
+        onLaunchAtLoginChange={handleLaunchAtLoginChange}
+        icloudSync={icloudSync}
+        onIcloudSyncChange={handleIcloudSyncChange}
+        onImportLayouts={handleImportLayouts}
+        onExportLayouts={handleExportLayouts}
+        onCheckForUpdates={handleCheckForUpdates}
+        onMinimizeApp={handleMinimizeApp}
+        onOpenAccessibilitySettings={openAccessibilitySettings}
+        onRecheckAccessibility={refreshRuntime}
+      />
+
+      {moveWarningApps ? (
+        <MoveWarningDialog apps={moveWarningApps} onDismiss={handleMoveWarningDismiss} />
+      ) : null}
     </div>
   );
 }

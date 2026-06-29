@@ -10,6 +10,7 @@
     "frontendDist": "../dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "WorkNeat",
@@ -17,16 +18,32 @@
         "height": 780,
         "minWidth": 960,
         "minHeight": 680,
-        "center": true
+        "center": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "transparent": true,
+        "windowEffects": {
+          "effects": ["sidebar"],
+          "state": "followsWindowActiveState"
+        }
       }
     ],
     "security": {
       "csp": null
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVGMTk2QjFFODQ3NUJBQTMKUldTanVuV0VIbXNaNzMwaFYreWUyM0hXckZNaERtS25keitTT3NJcXZzdVhPTXJwdGp1Sk4vQjIK",
+      "endpoints": [
+        "https://github.com/ArB1t3r/WorkNeat/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "category": "Productivity",
+    "createUpdaterArtifacts": true,
     "icon": ["icons/icon.icns"],
     "targets": ["dmg", "app"],
     "macOS": {

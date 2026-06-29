@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { Button, Chip, Input, Tooltip } from "./heroui";
-import { Download, Keyboard, LocateFixed, Play, Save, ShieldCheck } from "lucide-react";
+import { Button, Chip, Input, TextField, Tooltip } from "@heroui/react";
+import { Keyboard, LocateFixed, Play, Save, ShieldCheck } from "lucide-react";
 import type { PermissionStatus, WorkspaceProfile } from "../types/layout";
 import {
   formatHotkeyDisplay,
@@ -43,11 +43,13 @@ export function TopBar({
   const commitTimerRef = useRef<number | null>(null);
   const permissionTone =
     accessibility === "granted" ? "success" : accessibility === "missing" ? "warning" : "default";
+  const statusText =
+    shortcutFailures.length > 0
+      ? `Shortcut unavailable: ${shortcutFailures.join(", ")}`
+      : statusMessage || (hasUnsavedChanges ? "Unsaved changes" : "Saved locally");
 
   useEffect(() => {
-    if (isRecordingHotkey) {
-      hotkeyButtonRef.current?.focus();
-    }
+    if (isRecordingHotkey) hotkeyButtonRef.current?.focus();
   }, [isRecordingHotkey]);
 
   useEffect(() => {
@@ -56,7 +58,6 @@ export function TopBar({
 
   function clearHotkeyCommitTimer() {
     if (commitTimerRef.current === null) return;
-
     window.clearTimeout(commitTimerRef.current);
     commitTimerRef.current = null;
   }
@@ -70,12 +71,10 @@ export function TopBar({
 
   function finishHotkeyRecording(shouldCommit: boolean) {
     clearHotkeyCommitTimer();
-
     if (shouldCommit) {
       const captured = hotkeyFromKeyTokens(recordedKeyTokensRef.current);
       if (captured) onHotkeyChange(captured.hotkey);
     }
-
     recordedKeyTokensRef.current = [];
     setRecordedHotkeyPreview("");
     setIsRecordingHotkey(false);
@@ -88,7 +87,6 @@ export function TopBar({
 
   function handleHotkeyKeyDown(event: KeyboardEvent<HTMLButtonElement>) {
     if (!isRecordingHotkey) return;
-
     event.preventDefault();
     event.stopPropagation();
 
@@ -96,7 +94,6 @@ export function TopBar({
       finishHotkeyRecording(false);
       return;
     }
-
     if (event.repeat) return;
 
     const keyToken = keyTokenFromKeyboardEvent(event);
@@ -108,90 +105,99 @@ export function TopBar({
     }
 
     setRecordedHotkeyPreview(formatHotkeyDisplay(recordedKeyTokensRef.current.join("+")));
-
-    if (hotkeyFromKeyTokens(recordedKeyTokensRef.current)) {
-      scheduleHotkeyCommit();
-    }
+    if (hotkeyFromKeyTokens(recordedKeyTokensRef.current)) scheduleHotkeyCommit();
   }
 
   function handleHotkeyKeyUp(event: KeyboardEvent<HTMLButtonElement>) {
     if (!isRecordingHotkey) return;
-
     event.preventDefault();
     event.stopPropagation();
   }
 
+  const hotkeyLabel = isRecordingHotkey
+    ? recordedHotkeyPreview || "Press keys…"
+    : profile.hotkey || "Set hotkey";
+
   return (
-    <header className="topbar">
-      <div className="topbar-main">
-        <div className="topbar-fields">
-          <Input
-            size="sm"
-            radius="sm"
-            label="Layout"
+    <header
+      data-tauri-drag-region
+      className="app-drag-region work-surface flex items-center justify-between gap-4 border-b border-separator px-5 py-3"
+    >
+      <div className="flex min-w-0 flex-col gap-1.5">
+        <div className="flex items-center gap-2.5">
+          <TextField
+            aria-label="Layout name"
+            className="w-[220px]"
             value={profile.name}
-            onValueChange={onNameChange}
-            className="name-input"
-          />
-          <Button
+            onChange={onNameChange}
+          >
+            <Input placeholder="Layout name" />
+          </TextField>
+
+          <button
             ref={hotkeyButtonRef}
-            size="sm"
-            radius="sm"
-            variant={isRecordingHotkey ? "solid" : "flat"}
-            color={isRecordingHotkey ? "primary" : "default"}
-            className="hotkey-input"
-            startContent={<Keyboard size={16} />}
-            onPress={beginHotkeyRecording}
+            type="button"
+            data-recording={isRecordingHotkey}
+            className={[
+              "inline-flex h-9 min-w-[136px] items-center gap-2 rounded-lg border px-3 text-sm font-medium outline-none transition-colors",
+              "focus-visible:ring-2 focus-visible:ring-focus",
+              isRecordingHotkey
+                ? "border-accent bg-accent text-accent-foreground"
+                : "border-field-border bg-field text-foreground hover:bg-field-hover",
+            ].join(" ")}
+            onClick={beginHotkeyRecording}
             onKeyDown={handleHotkeyKeyDown}
             onKeyUp={handleHotkeyKeyUp}
             onBlur={() => finishHotkeyRecording(true)}
           >
-            <span>{isRecordingHotkey ? recordedHotkeyPreview || "Press keys" : profile.hotkey || "Set hotkey"}</span>
-          </Button>
+            <Keyboard size={16} className="shrink-0 opacity-80" />
+            <span className="truncate">{hotkeyLabel}</span>
+          </button>
         </div>
 
-        <div className="topbar-status">
-          {shortcutFailures.length > 0
-            ? `Shortcut unavailable: ${shortcutFailures.join(", ")}`
-            : statusMessage || (hasUnsavedChanges ? "Unsaved changes" : "Saved locally")}
+        <div
+          data-tauri-drag-region
+          className="max-w-[560px] truncate text-xs text-muted"
+          title={statusText}
+        >
+          {statusText}
         </div>
       </div>
 
-      <div className="topbar-actions">
-        <Chip color={permissionTone} radius="sm" variant="flat" startContent={<ShieldCheck size={14} />}>
-          Accessibility {accessibility}
+      <div className="flex shrink-0 items-center gap-2.5">
+        <Chip color={permissionTone} variant="soft">
+          <ShieldCheck size={14} />
+          <Chip.Label>Accessibility {accessibility}</Chip.Label>
         </Chip>
-        <Tooltip content={`Mirror tracked apps on ${mirrorDisplayName}`}>
-          <Button
-            size="sm"
-            radius="sm"
-            variant="flat"
-            className="mirror-button"
-            startContent={<LocateFixed size={16} />}
-            onPress={onMirror}
-          >
-            Mirror {mirrorDisplayName}
+
+        <Tooltip delay={400}>
+          <Button variant="secondary" className="max-w-[200px]" onPress={onMirror}>
+            <LocateFixed size={16} />
+            <span className="truncate">Mirror {mirrorDisplayName}</span>
           </Button>
+          <Tooltip.Content showArrow>
+            <Tooltip.Arrow />
+            Mirror tracked apps on {mirrorDisplayName}
+          </Tooltip.Content>
         </Tooltip>
-        <Tooltip content="Export layout">
-          <Button isIconOnly size="sm" radius="sm" variant="flat" aria-label="Export layout">
-            <Download size={16} />
-          </Button>
-        </Tooltip>
-        <Tooltip content="Save current layout locally">
+
+        <Tooltip delay={400}>
           <Button
             isIconOnly
-            size="sm"
-            radius="sm"
-            color={hasUnsavedChanges ? "primary" : "default"}
-            variant={hasUnsavedChanges ? "solid" : "flat"}
+            variant={hasUnsavedChanges ? "primary" : "secondary"}
             aria-label="Save layout"
             onPress={onSave}
           >
             <Save size={16} />
           </Button>
+          <Tooltip.Content showArrow>
+            <Tooltip.Arrow />
+            Save layout locally
+          </Tooltip.Content>
         </Tooltip>
-        <Button size="sm" radius="sm" color="primary" startContent={<Play size={16} />} onPress={onApply}>
+
+        <Button onPress={onApply}>
+          <Play size={16} />
           Apply
         </Button>
       </div>

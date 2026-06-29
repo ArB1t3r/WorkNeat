@@ -1,7 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { mockRuntime } from "./mockData";
 import type { PermissionStatus } from "../types/layout";
-import type { AppConfig, AppSource, RuntimeSnapshot, WorkspaceProfile } from "../types/layout";
+import type {
+  AppConfig,
+  ApplyResult,
+  AppSource,
+  RuntimeSnapshot,
+  WorkspaceProfile,
+} from "../types/layout";
 
 export async function getRuntimeSnapshot(): Promise<RuntimeSnapshot> {
   try {
@@ -56,13 +63,31 @@ export async function registerProfileShortcuts(
   }
 }
 
-export async function applyWorkspaceProfile(profile: WorkspaceProfile) {
-  try {
-    return await invoke<string>("apply_workspace_profile", { profile });
-  } catch (error) {
-    console.warn("Unable to apply layout", error);
-    return null;
-  }
+export async function applyWorkspaceProfile(profile: WorkspaceProfile): Promise<ApplyResult> {
+  // Let failures surface (e.g. permission missing) so the UI can report them.
+  return await invoke<ApplyResult>("apply_workspace_profile", { profile });
+}
+
+export async function exportConfigToFile(contents: string): Promise<boolean> {
+  const path = await save({
+    defaultPath: "workneat-layouts.json",
+    filters: [{ name: "WorkNeat Layouts", extensions: ["json"] }],
+  });
+  if (!path) return false;
+
+  await invoke("export_config", { path, contents });
+  return true;
+}
+
+export async function importConfigFromFile(): Promise<string | null> {
+  const selected = await open({
+    multiple: false,
+    directory: false,
+    filters: [{ name: "WorkNeat Layouts", extensions: ["json"] }],
+  });
+  if (!selected || Array.isArray(selected)) return null;
+
+  return await invoke<string>("import_config", { path: selected });
 }
 
 export async function listWindowSources(): Promise<AppSource[]> {
@@ -96,4 +121,19 @@ export async function revealCurrentAppInFinder() {
   } catch {
     return null;
   }
+}
+
+export async function isLaunchAtLoginEnabled(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("is_launch_at_login_enabled");
+  } catch (error) {
+    console.warn("Unable to read launch-at-login state", error);
+    return false;
+  }
+}
+
+export async function setLaunchAtLogin(enable: boolean): Promise<void> {
+  // Let failures surface so the settings UI can report why the login item
+  // could not be written, instead of silently flipping back.
+  await invoke("set_launch_at_login", { enable });
 }

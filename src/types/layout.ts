@@ -8,6 +8,8 @@ export type PermissionStatus = "unknown" | "granted" | "missing";
 
 export type AppIconId = "display" | "tiles" | "layers" | "focus";
 
+export type ThemeMode = "light" | "dark" | "system";
+
 export interface RelativeFrame {
   x: number;
   y: number;
@@ -81,6 +83,17 @@ export interface AppConfig {
   appIconId: AppIconId;
   hideDockWhenMinimized: boolean;
   snapToGrid: boolean;
+  theme: ThemeMode;
+  launchAtLogin: boolean;
+  gridColumns: number;
+  gridRows: number;
+  suppressMoveWarnings: boolean;
+  icloudSync: boolean;
+}
+
+export interface ApplyResult {
+  movedWindows: number;
+  unmovedApps: string[];
 }
 
 export interface RuntimeSnapshot {
